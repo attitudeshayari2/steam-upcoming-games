@@ -20,7 +20,13 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-MAX_GAMES = 2000          # upper limit of games to keep (change if you want more/less)
+# Steam returns "coming soon" games sorted by release date (earliest first, TBA last).
+# To cover ALL months/years (not only the next two weeks) we read every page and cap each bucket:
+MAX_PER_MONTH = 300       # max games kept for each month that has an exact day or month
+MAX_UNDATED_PER_YEAR = 200  # max games kept per year when only a year/quarter/season is known
+MAX_TBA = 200             # max games kept with no date (TBA)
+MAX_GAMES = 8000          # hard safety limit for the whole file
+MAX_PAGES = 500           # hard safety limit for Steam requests
 PAGE_SIZE = 50
 DELAY = 1.5               # seconds between Steam requests
 OUTPUT = "games.json"
@@ -181,17 +187,41 @@ def fetch_page(start):
     return None
 
 
-def main():
-    games, seen = [], set()
-    start, total = 0, 0
+def bucket(g):
+    if g["p"] == "tba":
+        return "tba"
+    if g["p"] in ("day", "month"):
+        return g["d"][:7]            # e.g. 2026-11
+    return g["d"][:4] + "-x"         # year known, month not
 
-    while len(games) < MAX_GAMES:
+
+def bucket_limit(key):
+    if key == "tba":
+        return MAX_TBA
+    if key.endswith("-x"):
+        return MAX_UNDATED_PER_YEAR
+    return MAX_PER_MONTH
+
+
+def main():
+    games, seen, counts = [], set(), {}
+    skipped = 0
+    start, total, pages = 0, 0, 0
+    partial = False
+
+    while pages < MAX_PAGES and len(games) < MAX_GAMES:
         data = fetch_page(start)
         if data is None:
+            if len(games) >= 1000:
+                print("WARNING: Steam stopped responding at start=%d. Using the %d games collected so far." % (start, len(games)))
+                partial = True
+                break
             fail("Steam did not respond correctly at start=%d. Old %s kept." % (start, OUTPUT))
         total = int(data.get("total_count") or 0)
         items = parse_results(data["results_html"])
-        print("start=%d -> %d games parsed (Steam total: %d)" % (start, len(items), total))
+        pages += 1
+        if pages % 10 == 1:
+            print("start=%d -> %d games parsed (Steam total: %d, kept so far: %d)" % (start, len(items), total, len(games)))
 
         if not items:
             if start == 0:
@@ -203,13 +233,19 @@ def main():
                 continue
             seen.add(it["id"])
             d = parse_date(it["date"])
-            games.append({"id": it["id"], "n": it["title"], "p": d["p"], "d": d["d"], "e": d["e"], "l": d["l"]})
-            if len(games) >= MAX_GAMES:
-                break
+            g = {"id": it["id"], "n": it["title"], "p": d["p"], "d": d["d"], "e": d["e"], "l": d["l"]}
+            k = bucket(g)
+            if counts.get(k, 0) >= bucket_limit(k):
+                skipped += 1
+                continue
+            counts[k] = counts.get(k, 0) + 1
+            games.append(g)
 
         start += PAGE_SIZE
         if total and start >= total:
             break
+        if counts.get("tba", 0) >= MAX_TBA:
+            break                      # TBA games come last, so everything dated has been read
         time.sleep(DELAY)
 
     if not games:
@@ -234,6 +270,7 @@ def main():
         "source": "steam",
         "steam_total": total,
         "count": len(games),
+        "partial": partial,
         "games": games,
     }
     tmp = OUTPUT + ".tmp"
@@ -241,8 +278,12 @@ def main():
         json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
     os.replace(tmp, OUTPUT)
 
-    print("DONE: %d games saved (Steam total %d). By date type: %s" % (len(games), total, stats))
-    for g in games[:5]:
+    print("DONE: %d games saved (Steam total %d, %d requests, %d skipped by caps)." % (len(games), total, pages, skipped))
+    print("By date type:", stats)
+    months = sorted(k for k in counts if k != "tba" and not k.endswith("-x"))
+    print("Per month:", ", ".join("%s=%d" % (m, counts[m]) for m in months))
+    print("Undated by year:", {k: v for k, v in sorted(counts.items()) if k.endswith("-x")}, "| TBA:", counts.get("tba", 0))
+    for g in games[:3]:
         print("  sample:", g["n"], "|", g["p"], g["d"] or "TBA")
 
 
